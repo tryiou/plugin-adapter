@@ -19,7 +19,7 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
     Get server connectivity status using the cheapest possible ElectrumX call.
     """
     if not config_manager.has_currency(currency):
-        print(f"[client] ERROR: Attempted to get info for unsupported coin {currency}")
+        logger.error(f"[client] Attempted to get info for unsupported coin {currency}")
         return None
 
     coin_config = config_manager.get_coin_config(currency)
@@ -39,18 +39,17 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
                     await session.send_request("server.ping", [])
 
                     if initial:
-                        print(f"[heartbeat] Initial heartbeat for {currency}:")
-                        print(f"\tConnected via server.ping")
+                        logger.info(f"[heartbeat] Initial heartbeat for {currency}: Connected via server.ping")
                     else:
-                        print(f"[heartbeat] {currency}: OK")
+                        logger.info(f"[heartbeat] {currency}: OK")
 
                     return {"status": "connected", "method": "server.ping"}
 
         except Exception as e:
             if initial:
-                print(f"[heartbeat] Failed to get info for {currency} during initial setup: {e}")
+                logger.error(f"[heartbeat] Failed to get info for {currency} during initial setup: {e}")
             else:
-                print(f"[heartbeat] Failed to get info for {currency}: {e}")
+                logger.error(f"[heartbeat] Failed to get info for {currency}: {e}")
             return None
 
     return await send_request()

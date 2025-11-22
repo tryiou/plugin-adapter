@@ -73,8 +73,7 @@ class HeartbeatManager:
                 except Exception as e:
                     logger.error(f"[heartbeat] Error in periodic heartbeat: {e}")
 
-                # Wait 2 seconds or until stop is requested
-                if self._stop_event.wait(timeout=2):
+                if self._stop_event.wait(timeout=30):
                     break
 
         except Exception as e:
@@ -225,12 +224,12 @@ class PluginAdapterApplication:
                 # Register socket in configuration
                 config_manager.set_coin_socket(currency, socket)
 
-                print(f"[adapter] Registered host {coin_config.host} port {coin_config.port} for coin {currency}")
+                logger.info(f"[adapter] Registered host {coin_config.host} port {coin_config.port} for coin {currency}")
 
             except Exception as e:
                 logger.error(f"[adapter] Failed to connect to {currency}: {e}")
 
-        print(f"[adapter] Have {len(currencies)} coin/port pair(s).")
+        logger.info(f"[adapter] Have {len(currencies)} coin/port pair(s)")
 
     async def start(self, port: int = 5000) -> None:
         """
@@ -242,7 +241,7 @@ class PluginAdapterApplication:
         await self.initialize()
         await self._server.start(port)
         self._install_signal_handlers()
-        print(f"[server] Starting RPC server on port {port}.")
+        logger.info(f"[server] Starting RPC server on port {port}")
 
     async def stop(self) -> None:
         """Stop the application."""
