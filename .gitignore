@@ -4,3 +4,4 @@ venv
 debug.log
 *.pyc
 .aider*
+docs/_build
