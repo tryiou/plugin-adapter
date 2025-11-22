@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class PluginAdapterError(Exception):
     """Base exception class for plugin adapter errors."""
-    
+
     def __init__(self, message: str, error_code: int = -1, original_error: Optional[Exception] = None):
         self.message = message
         self.error_code = error_code
@@ -18,35 +18,35 @@ class PluginAdapterError(Exception):
 
 class NetworkError(PluginAdapterError):
     """Exception raised for network-related errors."""
-    
+
     def __init__(self, message: str, original_error: Optional[Exception] = None):
         super().__init__(message, error_code=-1, original_error=original_error)
 
 
 class ProtocolError(PluginAdapterError):
     """Exception raised for protocol-related errors."""
-    
+
     def __init__(self, message: str, original_error: Optional[Exception] = None):
         super().__init__(message, error_code=-2, original_error=original_error)
 
 
 class TransactionError(PluginAdapterError):
     """Exception raised for transaction-related errors."""
-    
+
     def __init__(self, message: str, original_error: Optional[Exception] = None):
         super().__init__(message, error_code=-25, original_error=original_error)
 
 
 class ValidationError(PluginAdapterError):
     """Exception raised for validation errors."""
-    
+
     def __init__(self, message: str, original_error: Optional[Exception] = None):
         super().__init__(message, error_code=-5, original_error=original_error)
 
 
 class ConfigurationError(PluginAdapterError):
     """Exception raised for configuration-related errors."""
-    
+
     def __init__(self, message: str, original_error: Optional[Exception] = None):
         super().__init__(message, error_code=-10, original_error=original_error)
 
@@ -62,7 +62,7 @@ def create_error_response(error: PluginAdapterError) -> Dict[str, Any]:
         Standardized error response dictionary
     """
     logger.error(f"[server] {type(error).__name__}: {error.message}")
-    
+
     return {
         'result': None,
         'error': {
@@ -99,6 +99,7 @@ def handle_exception(func):
     Returns:
         Wrapped function with exception handling
     """
+
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
@@ -116,5 +117,5 @@ def handle_exception(func):
             # Wrap unexpected errors
             error = ProtocolError(f"Unexpected error: {str(e)}", e)
             return create_error_response(error)
-    
+
     return wrapper

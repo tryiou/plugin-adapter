@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 
 import asyncio
+import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
-from decimal import Decimal
-
 from aiorpcx import connect_rs, timeout_after
-from src.core.error_handling import NetworkError, ProtocolError
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+
 from src.core.configuration import config_manager
+from src.core.error_handling import NetworkError, ProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
     coin_config = config_manager.get_coin_config(currency)
     if not coin_config:
         return None
-        
+
     host = coin_config.host
     port = coin_config.port
 
@@ -51,7 +52,8 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
                         print(f"\tServer version: {result['version']}")
                     else:
                         print(f"[heartbeat] {currency}: ")
-                        print(f"\tHeight (DB/Daemon): {str(result['db_height'])} / {str(result['daemon_height'])} blocks")
+                        print(
+                            f"\tHeight (DB/Daemon): {str(result['db_height'])} / {str(result['daemon_height'])} blocks")
                         print(f"\tuptime {result['uptime']}")
 
                     return result
@@ -61,7 +63,7 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
             else:
                 print(f"[heartbeat] Failed to get info for {currency}: {e}")
             return None
-    
+
     return await send_request()
 
 
@@ -82,16 +84,16 @@ async def get_block_count(currency: str) -> Optional[int]:
     coin_config = config_manager.get_coin_config(currency)
     if not coin_config or not coin_config.socket:
         return None
-        
+
     socket = coin_config.socket
     start_time = time.time()
-    
+
     try:
         res = await socket.send_message("getblockcount", (), timeout=2)
         end_time = time.time()
         execution_time = end_time - start_time
         logger.debug(f"[client] Execution time for 'get_block_count' {currency}: {execution_time} seconds")
-        
+
         if res in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
             return None
         return res
@@ -117,7 +119,7 @@ async def get_plugin_fees(currency: str) -> Optional[float]:
     coin_config = config_manager.get_coin_config(currency)
     if not coin_config or not coin_config.socket:
         return None
-        
+
     socket = coin_config.socket
 
     try:
@@ -178,7 +180,7 @@ def validate_address_list(addresses: Any) -> List[str]:
     """
     if not addresses:
         raise ValueError("No addresses provided")
-    
+
     # Handle JSON string input
     if isinstance(addresses, str):
         try:
@@ -186,20 +188,20 @@ def validate_address_list(addresses: Any) -> List[str]:
         except json.JSONDecodeError:
             # If not valid JSON, treat as comma-separated string
             addresses = addresses.split(',')
-    
+
     # Validate list format
     if not isinstance(addresses, list):
         raise ValueError("Addresses must be provided as a list or comma-separated string")
-    
+
     # Clean and validate individual addresses
     cleaned_addresses = []
     for addr in addresses:
         if isinstance(addr, str) and addr.strip():
             cleaned_addresses.append(addr.strip())
-    
+
     if not cleaned_addresses:
         raise ValueError("No valid addresses found")
-    
+
     return cleaned_addresses
 
 
@@ -227,11 +229,11 @@ def format_balance_output(balance_data: Dict[str, int]) -> Dict[str, Any]:
         Formatted balance response
     """
     result = balance_data.copy()
-    
+
     if result['confirmed'] > 0:
         result['confirmed'] = float(result['confirmed']) / 100000000.0
 
     if result['unconfirmed'] > 0:
         result['unconfirmed'] = float(result['unconfirmed']) / 100000000.0
-    
+
     return result

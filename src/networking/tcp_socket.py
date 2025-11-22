@@ -2,9 +2,8 @@
 
 import asyncio
 import logging
-from typing import Optional, Any, Union
-
 from aiorpcx import connect_rs, timeout_after
+from typing import Optional, Any, Union
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +17,7 @@ class TCPSocket:
     Thread-safe TCP socket wrapper for ElectrumX server communication.
     Provides connection management and RPC message sending capabilities.
     """
-    
+
     def __init__(self, host: str, port: int) -> None:
         """
         Initialize TCP socket connection parameters.
