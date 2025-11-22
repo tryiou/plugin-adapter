@@ -16,14 +16,7 @@ logger = logging.getLogger(__name__)
 
 async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, Any]]:
     """
-    Get server info for a specific currency.
-    
-    Args:
-        currency: Currency symbol
-        initial: Whether this is an initial connection check
-        
-    Returns:
-        Server info dictionary or None if failed
+    Get server connectivity status using the cheapest possible ElectrumX call.
     """
     if not config_manager.has_currency(currency):
         print(f"[client] ERROR: Attempted to get info for unsupported coin {currency}")
@@ -34,29 +27,25 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
         return None
 
     host = coin_config.host
-    port = coin_config.port
-
-    result = None
+    port = coin_config.port + 1000  # Use port 9000 (RPC port)
 
     async def send_request():
         try:
-            async with timeout_after(15):
+            async with timeout_after(5):  # Shorter timeout for cheap call
                 async with connect_rs(host, port) as session:
                     session.transport._framer.max_size = 0
-                    nonlocal result
-                    result = await session.send_request("getinfo")
+
+                    # CHEAP CALL: server.ping is the lightest possible request
+                    await session.send_request("server.ping", [])
 
                     if initial:
                         print(f"[heartbeat] Initial heartbeat for {currency}:")
-                        print(f"\tPID: {str(result['pid'])}")
-                        print(f"\tServer version: {result['version']}")
+                        print(f"\tConnected via server.ping")
                     else:
-                        print(f"[heartbeat] {currency}: ")
-                        print(
-                            f"\tHeight (DB/Daemon): {str(result['db_height'])} / {str(result['daemon_height'])} blocks")
-                        print(f"\tuptime {result['uptime']}")
+                        print(f"[heartbeat] {currency}: OK")
 
-                    return result
+                    return {"status": "connected", "method": "server.ping"}
+
         except Exception as e:
             if initial:
                 print(f"[heartbeat] Failed to get info for {currency} during initial setup: {e}")
