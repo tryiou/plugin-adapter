@@ -73,22 +73,23 @@ async def switchcase(request_json: Dict[str, Any]) -> str:
     Switch-case dispatcher for RPC methods - maintains exact same logic as original.
     """
     switcher = {
-        'getutxos': utxo_handler.getutxos(request_json['params']),
-        'getrawtransaction': tx_handler.getrawtransaction(request_json['params']),
-        'getrawmempool': tx_handler.getrawmempool(request_json['params']),
-        'getblockcount': block_handler.getblockcount(request_json['params']),
-        'sendrawtransaction': tx_handler.sendrawtransaction(request_json['params']),
-        'gettransaction': tx_handler.gettransaction(request_json['params']),
-        'getblock': block_handler.getblock(request_json['params']),
-        'getblockhash': block_handler.getblockhash(request_json['params']),
-        'heights': plugin_block_heights(),
-        'fees': plugin_tx_fees(),
-        'getbalance': balance_handler.getbalance(request_json['params']),
-        'gethistory': history_handler.gethistory(request_json['params']),
-        'ping': utility_handler.ping()
+        'getutxos': lambda: utxo_handler.getutxos(request_json['params']),
+        'getrawtransaction': lambda: tx_handler.getrawtransaction(request_json['params']),
+        'getrawmempool': lambda: tx_handler.getrawmempool(request_json['params']),
+        'getblockcount': lambda: block_handler.getblockcount(request_json['params']),
+        'sendrawtransaction': lambda: tx_handler.sendrawtransaction(request_json['params']),
+        'gettransaction': lambda: tx_handler.gettransaction(request_json['params']),
+        'getblock': lambda: block_handler.getblock(request_json['params']),
+        'getblockhash': lambda: block_handler.getblockhash(request_json['params']),
+        'heights': lambda: plugin_block_heights(),
+        'fees': lambda: plugin_tx_fees(),
+        'getbalance': lambda: balance_handler.getbalance(request_json['params']),
+        'gethistory': lambda: history_handler.gethistory(request_json['params']),
+        'ping': lambda: utility_handler.ping()
     }
     
-    result = await switcher.get(request_json['method'], utility_handler.ping())
+    method_func = switcher.get(request_json['method'], lambda: utility_handler.ping())
+    result = await method_func()
     return result
 
 
