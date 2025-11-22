@@ -184,13 +184,19 @@ async def main():
         while app.heartbeat_manager._running:
             await asyncio.sleep(1)
             
-    except KeyboardInterrupt:
-        logger.info("[adapter] Received keyboard interrupt")
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("[adapter] Application startup cancelled - this is expected during shutdown")
     except Exception as e:
         logger.error(f"[adapter] Fatal error: {e}")
         sys.exit(1)
     finally:
-        await app.stop()
+        # Ensure proper cleanup regardless of how we exit
+        try:
+            await app.stop()
+        except Exception as e:
+            logger.error(f"[adapter] Error during cleanup: {e}")
+            # Force exit if cleanup fails
+            sys.exit(1)
 
 
 if __name__ == '__main__':

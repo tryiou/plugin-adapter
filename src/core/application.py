@@ -193,14 +193,22 @@ class PluginAdapterApplication:
     async def initialize(self) -> None:
         """Initialize the application by setting up all components."""
         logger.info("[adapter] Initializing plugin adapter application")
+        
+        try:
+            # Load configuration
+            config_manager.load_from_environment()
 
-        # Load configuration
-        config_manager.load_from_environment()
+            # Setup network connections
+            await self._setup_network_connections()
 
-        # Setup network connections
-        await self._setup_network_connections()
-
-        logger.info("[adapter] Application initialization complete")
+            logger.info("[adapter] Application initialization complete")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            logger.info("[adapter] Initialization cancelled, shutting down")
+            # Re-raise to allow proper cleanup
+            raise
+        except Exception as e:
+            logger.error(f"[adapter] Failed to initialize: {e}")
+            raise
 
     async def _setup_network_connections(self) -> None:
         """Setup TCP connections to all configured ElectrumX servers."""
@@ -253,16 +261,25 @@ class PluginAdapterApplication:
     def _signal_handler(self, signum: int, frame: Any) -> None:
         """
         Handle shutdown signals gracefully.
+        This runs in the main thread, so we need to schedule shutdown in the event loop.
         
         Args:
             signum: Signal number
             frame: Signal frame
         """
         logger.info(f"[adapter] Caught signal {signum}. Shutting down gracefully.")
-
-        # This will be called from the main thread, so we need to stop the server
-        # The heartbeat manager will be stopped by the server's stop method
-        asyncio.create_task(self._server.stop())
+        
+        # Cancel any running tasks in the current event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Cancel all tasks except the current one
+                for task in asyncio.all_tasks(loop):
+                    if task is not asyncio.current_task(loop):
+                        task.cancel()
+        except RuntimeError:
+            # No event loop running, signal was received during startup
+            logger.info("[adapter] Signal received during startup, will be handled by main loop")
 
     def _install_signal_handlers(self) -> None:
         """Install signal handlers for graceful shutdown."""
