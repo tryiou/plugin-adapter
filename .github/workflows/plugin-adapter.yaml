@@ -1,24 +1,36 @@
 name: plugin-adapter docker image
 on: [push, workflow_dispatch]
-jobs:
+permissions:
+  contents: read
+  packages: write
 
+jobs:
   build:
     runs-on: ubuntu-latest
     env:
       tag: latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+    
     - name: Login to DockerHub
-      run: echo ${{ secrets.org_blocknetdximg_password }} | docker login --username ${{ secrets.org_blocknetdximg_username }} --password-stdin 
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.org_blocknetdximg_username }}
+        password: ${{ secrets.org_blocknetdximg_password }}
+        
     - name: Image info
       run: echo Building ${{ github.workflow }} ${{ github.ref_name }}
-    - name: Set tag to branch name if not on master (now called main)
+      
+    - name: Set tag to branch name if not on main
       if: github.ref_name != 'main'
       run: echo "tag=${{ github.ref_name }}" >> $GITHUB_ENV
+      
     - name: Build an image
       run: docker build . --file Dockerfile --tag blocknetdx/plugin-adapter:${{ env.tag }}
+      
     - name: Push image
       run: docker push blocknetdx/plugin-adapter:${{ env.tag }}
+      
     - name: Remove dangling images
       if: ${{ always() }}
-      run: yes | docker image prune
+      run: docker builder prune --force
