@@ -29,9 +29,10 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
     host = coin_config.host
     port = coin_config.port + 1000  # Use port 9000 (RPC port)
 
-    # Log current socket state for debugging
+    # Log current socket state for debugging (only at info level when socket state changes)
     current_socket = coin_config.socket
-    logger.debug(f"[heartbeat] {currency} - Current socket state: {current_socket is not None}, Connected: {current_socket.is_connected if current_socket else 'N/A'}")
+    socket_status = "Connected" if current_socket and current_socket.is_connected else "Disconnected"
+    logger.debug(f"[heartbeat] {currency} - Current socket status: {socket_status}")
 
     async def send_request():
         try:
@@ -51,9 +52,12 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
                     # This ensures RPC calls use the working connection
                     try:
                         if current_socket:
-                            # Try to reconnect the existing socket
-                            await current_socket.reconnect_if_closing()
-                            logger.debug(f"[heartbeat] {currency} - Reconnected existing socket")
+                            # Only update socket if it's actually disconnected
+                            if not current_socket.is_connected:
+                                await current_socket.reconnect_if_closing()
+                                logger.debug(f"[heartbeat] {currency} - Reconnected existing socket")
+                            else:
+                                logger.debug(f"[heartbeat] {currency} - Socket already connected, no update needed")
                         else:
                             # Import TCPSocket locally to avoid circular import
                             from src.networking.tcp_socket import TCPSocket

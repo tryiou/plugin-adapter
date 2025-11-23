@@ -55,11 +55,8 @@ class TCPSocket:
     async def reconnect_if_closing(self) -> None:
         """Reconnect if the session is closed or doesn't exist."""
         async with self._lock:
-            session_state = "None" if self._session is None else f"Closing: {self._session.is_closing()}, Connected: {not self._session.is_closing()}"
-            logger.debug(f"[client] {self.host}:{self.port} - reconnect_if_closing called. Session state: {session_state}")
-            
             if self._session is None or self._session.is_closing():
-                logger.info(f"[client] {self.host}:{self.port} - Reconnecting socket (None: {self._session is None}, Closing: {self._session.is_closing() if self._session else 'N/A'})")
+                logger.debug(f"[client] {self.host}:{self.port} - Reconnecting socket (None: {self._session is None}, Closing: {self._session.is_closing() if self._session else 'N/A'})")
                 await self.connect()
 
     async def send_message(self, command: str, message: Any, timeout: int = 30) -> Union[int, Any]:

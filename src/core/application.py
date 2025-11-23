@@ -73,7 +73,7 @@ class HeartbeatManager:
                 except Exception as e:
                     logger.error(f"[heartbeat] Error in periodic heartbeat: {e}")
 
-                if self._stop_event.wait(timeout=30):
+                if self._stop_event.wait(timeout=15):
                     break
 
         except Exception as e:
