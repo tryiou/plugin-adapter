@@ -107,8 +107,16 @@ class ConfigurationManager:
         """
         with self._lock:
             if currency in self._coins:
+                old_socket = self._coins[currency].socket
                 self._coins[currency].socket = socket
+                
+                # Log socket state changes for debugging
+                old_state = "None" if old_socket is None else f"Connected: {old_socket.is_connected}"
+                new_state = "None" if socket is None else f"Connected: {socket.is_connected}"
+                logger.info(f"[config] {currency} - Socket updated. Old: {old_state}, New: {new_state}")
+                
                 return True
+            logger.warning(f"[config] Attempted to set socket for unknown currency: {currency}")
             return False
 
     def has_currency(self, currency: str) -> bool:

@@ -29,6 +29,10 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
     host = coin_config.host
     port = coin_config.port + 1000  # Use port 9000 (RPC port)
 
+    # Log current socket state for debugging
+    current_socket = coin_config.socket
+    logger.debug(f"[heartbeat] {currency} - Current socket state: {current_socket is not None}, Connected: {current_socket.is_connected if current_socket else 'N/A'}")
+
     async def send_request():
         try:
             async with timeout_after(5):  # Shorter timeout for cheap call
@@ -42,6 +46,24 @@ async def get_info(currency: str, initial: bool = False) -> Optional[Dict[str, A
                         logger.info(f"[heartbeat] Initial heartbeat for {currency}: Connected via server.ping")
                     else:
                         logger.info(f"[heartbeat] {currency}: OK")
+                    
+                    # CRITICAL FIX: Update the stored socket when heartbeat succeeds
+                    # This ensures RPC calls use the working connection
+                    try:
+                        if current_socket:
+                            # Try to reconnect the existing socket
+                            await current_socket.reconnect_if_closing()
+                            logger.debug(f"[heartbeat] {currency} - Reconnected existing socket")
+                        else:
+                            # Import TCPSocket locally to avoid circular import
+                            from src.networking.tcp_socket import TCPSocket
+                            # Create new socket and update config
+                            new_socket = TCPSocket(host, port)
+                            await new_socket.connect()
+                            config_manager.set_coin_socket(currency, new_socket)
+                            logger.info(f"[heartbeat] {currency} - Created and stored new socket")
+                    except Exception as socket_update_error:
+                        logger.error(f"[heartbeat] {currency} - Failed to update socket after successful heartbeat: {socket_update_error}")
 
                     return {"status": "connected", "method": "server.ping"}
 
@@ -71,9 +93,15 @@ async def get_block_count(currency: str) -> Optional[int]:
 
     coin_config = config_manager.get_coin_config(currency)
     if not coin_config or not coin_config.socket:
+        logger.debug(f"[client] {currency} - No socket available for block count")
         return None
 
     socket = coin_config.socket
+    
+    # Log socket state before attempting RPC call
+    socket_connected = socket.is_connected if socket else False
+    logger.debug(f"[client] {currency} - Attempting block count. Socket connected: {socket_connected}")
+    
     start_time = time.time()
 
     try:
@@ -83,7 +111,9 @@ async def get_block_count(currency: str) -> Optional[int]:
         logger.debug(f"[client] Execution time for 'get_block_count' {currency}: {execution_time} seconds")
 
         if res in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
+            logger.debug(f"[client] {currency} - Block count failed with error code: {res}")
             return None
+        logger.debug(f"[client] {currency} - Block count successful: {res}")
         return res
     except Exception as e:
         logger.error(f"[client] Error getting block count for {currency}: {e}")
@@ -106,15 +136,22 @@ async def get_plugin_fees(currency: str) -> Optional[float]:
 
     coin_config = config_manager.get_coin_config(currency)
     if not coin_config or not coin_config.socket:
+        logger.debug(f"[client] {currency} - No socket available for plugin fees")
         return None
 
     socket = coin_config.socket
+    
+    # Log socket state before attempting RPC call
+    socket_connected = socket.is_connected if socket else False
+    logger.debug(f"[client] {currency} - Attempting plugin fees. Socket connected: {socket_connected}")
 
     try:
         res = await socket.send_message("blockchain.relayfee", (), timeout=2)
 
         if res in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
+            logger.debug(f"[client] {currency} - Plugin fees failed with error code: {res}")
             return None
+        logger.debug(f"[client] {currency} - Plugin fees successful: {res}")
         return res
     except Exception as e:
         logger.error(f"[client] Error getting plugin fees for {currency}: {e}")
