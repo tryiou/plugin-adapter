@@ -1,29 +1,46 @@
 #!/usr/bin/env python3
 
-import asyncio
 import datetime
-import json
 import logging
 import time
-from decimal import Decimal
-from json import JSONDecodeError
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
+from src.core.application import PluginAdapterApplication
 from src.core.configuration import config_manager
-from src.core.error_handling import (
-    NetworkError, ProtocolError, TransactionError, ValidationError,
-    create_error_response, create_success_response
-)
+from src.core.constants import ConfigConstants
+from src.core.errors import ValidationError
+from src.core.validation import ParameterValidator
+from src.networking.tcp_socket import TCPSocket
+from src.utils.operation_logger import OperationLogger
+from src.utils.response_helper import ResponseHelper
+
+# Type variable for decorator
+F = TypeVar('F', bound=Callable[..., Any])
 
 logger = logging.getLogger(__name__)
 
 
+def validate_rpc_params(params: List[Any], min_length: int = 1) -> Optional[ValidationError]:
+    """
+    Centralized parameter validation for RPC methods using ParameterValidator.
+    
+    Args:
+        params: Parameters to validate
+        min_length: Minimum required length for params list
+        
+    Returns:
+        ValidationError if validation fails, None if valid
+    """
+    return ParameterValidator.validate_rpc_params(params, min_length)
+
+
 def TimestampMillisec64() -> int:
     """Get current timestamp in milliseconds since Unix epoch."""
-    return int((datetime.datetime.utcnow() - datetime.datetime(1970, 1, 1)).total_seconds() * 1000)
+    return int(
+        (datetime.datetime.utcnow() - datetime.datetime(ConfigConstants.UNIX_EPOCH_YEAR, 1, 1)).total_seconds() * 1000)
 
 
-def parse_response(response: List[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+def parse_response(response: Any) -> Optional[List[Dict[str, Any]]]:
     """
     Parse UTXO response data into standardized format.
     
@@ -35,7 +52,6 @@ def parse_response(response: List[List[Dict[str, Any]]]) -> Optional[List[Dict[s
     """
     refined_result = []
 
-    logger.debug(f"[server] response: {str(response)}")
     try:
         for utxos in response:
             for item in utxos:
@@ -49,478 +65,633 @@ def parse_response(response: List[List[Dict[str, Any]]]) -> Optional[List[Dict[s
 
         return refined_result
     except (TypeError, KeyError, ValueError) as e:
-        logger.info(f"[ERROR] Error parsing response: {str(e)}")
+        OperationLogger.error("parse_response", "system", e)
         return None
 
 
 class BaseRPCHandler:
     """Base class for all RPC handlers providing common functionality."""
 
-    def _validate_currency(self, currency: str) -> bool:
+    def __init__(self, app: PluginAdapterApplication):
+        """Initialize the base handler with application instance."""
+        self.app = app
+
+    def _validate_currency(self, currency: str) -> None:
         """
         Validate that a currency is supported and configured.
         
         Args:
             currency: Currency symbol to validate
             
-        Returns:
-            True if currency is valid, raises exception otherwise
+        Raises:
+            ValidationError: If currency is not supported or configured
         """
-        if not config_manager.has_currency(currency):
-            logger.warning(f"[client] ERROR: Attempted to get UTXOs from unsupported coin {currency}")
-            return False
-        return True
+        if not currency or not isinstance(currency, str):
+            raise ValidationError("Currency parameter is required and must be a string")
 
-    def _get_socket(self, currency: str):
-        """Get the socket connection for a currency."""
-        coin_config = config_manager.get_coin_config(currency)
-        if not coin_config or not coin_config.socket:
-            raise NetworkError(f"No socket connection available for {currency}")
-        return coin_config.socket
+        if not config_manager.has_currency(currency):
+            OperationLogger.warning("_validate_currency", currency,
+                                    ValidationError(f"Unsupported currency: {currency}"))
+            raise ValidationError(f"Unsupported currency: {currency}")
+
+    def _parse_addresses(self, raw_addresses: Any) -> List[str]:
+        """
+        Extract and validate addresses using centralized validator.
+        
+        Args:
+            raw_addresses: Raw addresses in various formats
+            
+        Returns:
+            List of validated address strings
+        """
+        return ParameterValidator.validate_addresses(raw_addresses)
 
 
 class UTXORPCHandler(BaseRPCHandler):
     """Handler for UTXO-related RPC methods."""
 
-    async def getutxos(self, params: List[Any]) -> str:
+    async def getutxos(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get UTXOs for specified addresses.
         
         Args:
             params: [currency, addresses]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with UTXO data
         """
         currency = params[0]
-        if not self._validate_currency(currency):
-            return json.dumps([])
-
-        # Parse addresses
-        try:
-            addresses = json.loads(params[1])
-        except (TypeError, JSONDecodeError):
-            addresses = params[1]
-
-        if isinstance(addresses, str):
-            addresses = addresses.split(',')
-
-        if not addresses or not isinstance(addresses, list):
-            return json.dumps([])
-
-        timestart = TimestampMillisec64()
-        logger.info(f"[server] {timestart} xrmgetutxos: {currency}")
-
-        socket = self._get_socket(currency)
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_batch("blockchain.address.listunspent", addresses, timeout=30)
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getutxos", currency, params)
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logging.info(f"[server] getutxos failed for coin: {currency}")
-                return json.dumps([])
+            addresses = self._parse_addresses(params[1])
+            if not addresses:
+                return ResponseHelper.error("No valid addresses provided")
 
-            res = {"utxos": parse_response(data)}
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
 
-            if res is None or res['utxos'] is None:
-                logging.info(f"[server] getutxos failed for coin: {currency}")
-                return json.dumps([])
+            data = await socket.send_batch(
+                "blockchain.address.listunspent", addresses, timeout=ConfigConstants.TIMEOUT_UTXO
+            )
 
-            logger.debug(f"DEBUG MESSAGE: {str(res)}")
-            logger.info(f"[server-end getutxos] completion time: {TimestampMillisec64() - timestart}ms")
+            result = parse_response(data) if data else None
+            if not result:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.success("getutxos", currency, duration, {"currency": currency, "result_count": 0})
+                return ResponseHelper.utxos([])
 
-            return json.dumps(res)
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("getutxos", currency, result, duration)
+            OperationLogger.success("getutxos", currency, duration, {"currency": currency, "result_count": len(result)})
+            return ResponseHelper.utxos(result)
 
-        except (NetworkError, ProtocolError) as e:
-            return json.dumps(create_error_response(e))
+        except Exception as e:
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getutxos", currency, e)
+            OperationLogger.success("getutxos", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
 
 class TransactionRPCHandler(BaseRPCHandler):
     """Handler for transaction-related RPC methods."""
 
-    async def getrawtransaction(self, params: List[Any]) -> str:
+    async def getrawtransaction(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get raw transaction data.
         
         Args:
             params: [currency, txid, verbose?]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with transaction data
         """
         currency = params[0]
-        txid = params[1]
-        verbose = False
-
-        if len(params) == 3:
-            v = params[2]
-            if any(x == v for x in [True, 'true', 'True', '1', 1]):
-                verbose = True
-
-        logger.info(f"[server] xrmgetrawtransaction: {currency} - {str(txid)}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("blockchain.transaction.get", [txid, verbose], timeout=30)
+            txid = params[1]
+            verbose = False
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getrawtranscation grabbing!")
-                res['error'] = -5
-            else:
-                res['result'] = data
+            if len(params) >= 3:
+                v = params[2]
+                if any(x == v for x in [True, 'true', 'True', '1', 1]):
+                    verbose = True
+
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getrawtransaction", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            # Validate transaction parameters
+            validation_error = ParameterValidator.validate_transaction_params(params)
+            if validation_error:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("getrawtransaction", currency, validation_error)
+                OperationLogger.success("getrawtransaction", currency, duration,
+                                        {"currency": currency, "success": False})
+                return ResponseHelper.from_exception(validation_error)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "blockchain.transaction.get", [txid, verbose], timeout=ConfigConstants.TIMEOUT_TRANSACTIONS
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("getrawtransaction", currency, data, duration)
+            OperationLogger.success("getrawtransaction", currency, duration,
+                                    {"currency": currency, "result_size": len(str(data))})
+            return ResponseHelper.transaction(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during getrawtranscation grabbing! {str(e)}")
-            res['error'] = -5
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getrawtransaction", currency, e)
+            OperationLogger.success("getrawtransaction", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
-
-    async def getrawmempool(self, params: List[Any]) -> str:
+    async def getrawmempool(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get raw mempool data.
         
         Args:
             params: [currency, verbose?]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with mempool data
         """
         currency = params[0]
-        verbose = False
-
-        if len(params) == 2:
-            v = params[1]
-            if any(x == v for x in [True, 'true', 'True', '1', 1]):
-                verbose = True
-
-        logger.info(f"[server] xrmgetrawmempool: {currency} - {str(verbose)}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("getrawmempool", [verbose], timeout=30)
+            verbose = False
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getrawmempool grabbing!")
-                res['error'] = -1
-            else:
-                res['result'] = data
+            if len(params) >= 2:
+                v = params[1]
+                if any(x == v for x in [True, 'true', 'True', '1', 1]):
+                    verbose = True
+
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getrawmempool", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "getrawmempool", [verbose], timeout=ConfigConstants.TIMEOUT_TRANSACTIONS
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("getrawmempool", currency, data, duration)
+            OperationLogger.success("getrawmempool", currency, duration,
+                                    {"currency": currency, "result_size": len(str(data))})
+            return ResponseHelper.success(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during getrawmempool grabbing! {str(e)}")
-            res['error'] = -1
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getrawmempool", currency, e)
+            OperationLogger.success("getrawmempool", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
-
-    async def sendrawtransaction(self, params: List[Any]) -> str:
+    async def sendrawtransaction(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Broadcast a raw transaction.
         
         Args:
             params: [currency, rawtx]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with transaction ID or error
         """
         currency = params[0]
-        rawtx = params[1]
-
-        logger.info(f"[server] xrmsendrawtransaction: {currency}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("blockchain.transaction.broadcast", [rawtx], timeout=30)
+            rawtx = params[1]
 
-            if data == -1:  # OS_ERROR
-                logger.error("[server] ERROR: OSError during sendrawtransaction!")
-                res['error'] = -1
-            elif data == -2:  # OTHER_EXCEPTION
-                logger.error("[server] ERROR: -25 during sendrawtransaction!")
-                res['error'] = -25
-            else:
-                res['result'] = data
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("sendrawtransaction", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            # Validate transaction parameters
+            validation_error = ParameterValidator.validate_transaction_params(params)
+            if validation_error:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("sendrawtransaction", currency, validation_error)
+                OperationLogger.success("sendrawtransaction", currency, duration,
+                                        {"currency": currency, "success": False})
+                return ResponseHelper.from_exception(validation_error)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "blockchain.transaction.broadcast", [rawtx], timeout=ConfigConstants.TIMEOUT_TRANSACTIONS
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("sendrawtransaction", currency, data, duration)
+            OperationLogger.success("sendrawtransaction", currency, duration,
+                                    {"currency": currency, "result_size": len(str(data))})
+            return ResponseHelper.success(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during sendrawtransaction! {str(e)}")
-            res['error'] = -25
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("sendrawtransaction", currency, e)
+            OperationLogger.success("sendrawtransaction", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
-
-    async def gettransaction(self, params: List[Any]) -> str:
+    async def gettransaction(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get transaction details.
         
         Args:
             params: [currency, txid]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with transaction data
         """
         currency = params[0]
-        txid = params[1]
-        verbose = True
-
-        logger.info(f"[server] xrmgettransaction: {currency} - {str(txid)}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("blockchain.transaction.get", [txid, verbose], timeout=30)
+            txid = params[1]
+            verbose = True
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getblock grabbing!")
-                res['error'] = -1
-            else:
-                res['result'] = data
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("gettransaction", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            # Validate transaction parameters
+            validation_error = ParameterValidator.validate_transaction_params(params)
+            if validation_error:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("gettransaction", currency, validation_error)
+                OperationLogger.success("gettransaction", currency, duration, {"currency": currency, "success": False})
+                return ResponseHelper.from_exception(validation_error)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "blockchain.transaction.get", [txid, verbose], timeout=ConfigConstants.TIMEOUT_TRANSACTIONS
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("gettransaction", currency, data, duration)
+            OperationLogger.success("gettransaction", currency, duration,
+                                    {"currency": currency, "result_size": len(str(data))})
+            return ResponseHelper.transaction(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during gettransaction grabbing! {str(e)}")
-            res['error'] = -1
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("gettransaction", currency, e)
+            OperationLogger.success("gettransaction", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
+    async def get_plugin_fees(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
+        """
+        Get relay fee for monitoring purposes using mempool.get_info.
+        
+        This method is specifically designed for monitoring endpoints and
+        uses the modern mempool.get_info protocol method instead of the
+        deprecated blockchain.relayfee.
+        
+        Args:
+            params: [currency]
+            socket: Connected TCPSocket instance (optional)
+            
+        Returns:
+            JSON string with relay fee or None if not supported
+        """
+        currency = params[0]
+        start_time = int(time.time() * 1000)
+
+        try:
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("get_plugin_fees", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message("blockchain.relayfee", [], timeout=ConfigConstants.TIMEOUT_FEES)
+
+            # Handle the relayfee response
+            if data is not None:
+                try:
+                    fee_float = float(data)
+                    duration = int(time.time() * 1000) - start_time
+                    OperationLogger.debug_result("get_plugin_fees", currency, fee_float, duration)
+                    OperationLogger.success("get_plugin_fees", currency, duration,
+                                            {"currency": currency, "fee": fee_float})
+                    return ResponseHelper.success(fee_float)
+                except (ValueError, TypeError) as parse_error:
+                    duration = int(time.time() * 1000) - start_time
+                    OperationLogger.debug_error("get_plugin_fees", currency, parse_error)
+                    OperationLogger.success("get_plugin_fees", currency, duration,
+                                            {"currency": currency, "success": False})
+                    return ResponseHelper.success(None)
+            else:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("get_plugin_fees", currency, Exception("data is None"))
+                OperationLogger.success("get_plugin_fees", currency, duration, {"currency": currency, "success": False})
+                return ResponseHelper.success(None)
+
+        except Exception as e:
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("get_plugin_fees", currency, e)
+            OperationLogger.success("get_plugin_fees", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
 
 class BlockRPCHandler(BaseRPCHandler):
     """Handler for block-related RPC methods."""
 
-    async def getblockcount(self, params: List[Any]) -> str:
+    async def getblockcount(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get current block count.
         
         Args:
             params: [currency]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with block count
         """
         currency = params[0]
-        logger.info(f"[server] xrmgetblockcount: {currency}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("getblockcount", (), timeout=2)
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getblockcount", currency, params)
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getblockcount grabbing!")
-                res['error'] = -1
-            else:
-                res['result'] = data
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "getblockcount", (), timeout=ConfigConstants.TIMEOUT_BLOCK_COUNT
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("getblockcount", currency, data, duration)
+            OperationLogger.success("getblockcount", currency, duration, {"currency": currency, "height": data})
+            return ResponseHelper.success(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during getblockcount grabbing! {str(e)}")
-            res['error'] = -1
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getblockcount", currency, e)
+            OperationLogger.success("getblockcount", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
-
-    async def getblock(self, params: List[Any]) -> str:
+    async def getblock(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get block data by hash.
         
         Args:
             params: [currency, hex_hash, verbose?]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with block data
         """
         currency = params[0]
-        hex_hash = params[1]
-        verbose = False
-
-        if len(params) == 3:
-            v = params[2]
-            if any(x == v for x in [True, 'true', 'True', '1', 1]):
-                verbose = True
-
-        logger.info(f"[server] xrmgetblock: {currency} - {str(hex_hash)}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("getblock", [hex_hash, verbose], timeout=30)
+            hex_hash = params[1]
+            verbose = False
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getblock grabbing!")
-                res['error'] = -1
+            if len(params) >= 3:
+                v = params[2]
+                if any(x == v for x in [True, 'true', 'True', '1', 1]):
+                    verbose = True
+
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getblock", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            # Validate block parameters
+            validation_error = ParameterValidator.validate_block_params(params)
+            if validation_error:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("getblock", currency, validation_error)
+                OperationLogger.success("getblock", currency, duration, {"currency": currency, "success": False})
+                return ResponseHelper.from_exception(validation_error)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "getblock", [hex_hash, verbose], timeout=ConfigConstants.TIMEOUT_TRANSACTIONS
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            if isinstance(data, dict) and 'tx' in data:
+                OperationLogger.debug_result("getblock", currency, data, duration)
+                OperationLogger.success("getblock", currency, duration,
+                                        {"currency": currency, "tx_count": len(data['tx'])})
             else:
-                res['result'] = data
+                OperationLogger.debug_result("getblock", currency, data, duration)
+                OperationLogger.success("getblock", currency, duration,
+                                        {"currency": currency, "result_size": len(str(data))})
+            return ResponseHelper.success(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during getblock grabbing! {str(e)}")
-            res['error'] = -1
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getblock", currency, e)
+            OperationLogger.success("getblock", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
-
-    async def getblockhash(self, params: List[Any]) -> str:
+    async def getblockhash(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get block hash by height.
         
         Args:
             params: [currency, height]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with block hash
         """
         currency = params[0]
-        height = params[1]
-
-        logger.info(f"[server] xrmgetblockhash: {currency} - {str(height)}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("getblockhash", [int(height)], timeout=30)
+            height = params[1]
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getblockhash grabbing!")
-                res['error'] = -1
-            else:
-                res['result'] = data
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getblockhash", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            # Validate block parameters
+            validation_error = ParameterValidator.validate_block_params(params)
+            if validation_error:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("getblockhash", currency, validation_error)
+                OperationLogger.success("getblockhash", currency, duration, {"currency": currency, "success": False})
+                return ResponseHelper.from_exception(validation_error)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "getblockhash", [int(height)], timeout=ConfigConstants.TIMEOUT_TRANSACTIONS
+            )
+
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("getblockhash", currency, data, duration)
+            OperationLogger.success("getblockhash", currency, duration, {"currency": currency, "height": height})
+            return ResponseHelper.success(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during getblockhash grabbing! {str(e)}")
-            res['error'] = -1
-
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getblockhash", currency, e)
+            OperationLogger.success("getblockhash", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
 
 class BalanceRPCHandler(BaseRPCHandler):
     """Handler for balance-related RPC methods."""
 
-    async def getbalance(self, params: List[Any]) -> str:
+    async def getbalance(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get balance for an address.
         
         Args:
             params: [currency, address]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with balance data
         """
         currency = params[0]
-        address = params[1]
-
-        logger.info(f"[server] xrmgetbalance: {currency} - {str(address)}")
-
-        if not self._validate_currency(currency):
-            return json.dumps(create_error_response(ProtocolError("Unsupported currency")))
-
-        socket = self._get_socket(currency)
-        res = {'result': None, 'error': None}
+        start_time = int(time.time() * 1000)
 
         try:
-            data = await socket.send_message("blockchain.address.get_balance", [str(address)], timeout=30)
+            address = params[1]
 
-            if data in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logger.error("[server] ERROR: Error during getbalance grabbing!")
-                res['error'] = -1
-            else:
-                if data['confirmed'] > 0:
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("getbalance", currency, params)
+
+            # Validate currency (will raise ValidationError if invalid)
+            self._validate_currency(currency)
+
+            # Validate balance parameters
+            validation_error = ParameterValidator.validate_balance_params(params)
+            if validation_error:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("getbalance", currency, validation_error)
+                OperationLogger.success("getbalance", currency, duration, {"currency": currency, "success": False})
+                return ResponseHelper.from_exception(validation_error)
+
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            data = await socket.send_message(
+                "blockchain.address.get_balance", [str(address)], timeout=ConfigConstants.TIMEOUT_BALANCE
+            )
+
+            if isinstance(data, dict):
+                if data.get('confirmed', 0) > 0:
                     data['confirmed'] = float(data['confirmed']) / 100000000.0
 
-                if data['unconfirmed'] > 0:
+                if data.get('unconfirmed', 0) > 0:
                     data['unconfirmed'] = float(data['unconfirmed']) / 100000000.0
 
-                res['result'] = data
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("getbalance", currency, data, duration)
+            OperationLogger.success("getbalance", currency, duration,
+                                    {"currency": currency, "result_size": len(str(data))})
+            return ResponseHelper.balance(data)
 
         except Exception as e:
-            logger.error(f"[server] ERROR: Error during getbalance grabbing! {str(e)}")
-            res['error'] = -1
-
-        logger.debug(f"DEBUG MESSAGE: {str(res)}")
-        return json.dumps(res)
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("getbalance", currency, e)
+            OperationLogger.success("getbalance", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
 
 class HistoryRPCHandler(BaseRPCHandler):
     """Handler for history-related RPC methods."""
 
-    async def gethistory(self, params: List[Any]) -> str:
+    async def gethistory(self, params: List[Any], socket: Optional[TCPSocket] = None) -> str:
         """
         Get transaction history for addresses.
         
         Args:
             params: [currency, addresses]
+            socket: Connected TCPSocket instance (optional)
             
         Returns:
             JSON string with history data
         """
         currency = params[0]
-
-        # Parse addresses
-        try:
-            addresses = json.loads(params[1])
-        except (TypeError, JSONDecodeError):
-            addresses = params[1]
-
-        if isinstance(addresses, str):
-            addresses = addresses.split(',')
-
-        if not addresses or not isinstance(addresses, list):
-            return json.dumps([])
-
-        timestart = TimestampMillisec64()
-        logger.info(f"[server] {timestart} xrmgethistory: {currency}")
-
-        if not self._validate_currency(currency):
-            return json.dumps([])
-
-        socket = self._get_socket(currency)
+        start_time = int(time.time() * 1000)
 
         try:
-            res = await socket.send_batch("gethistory", addresses, timeout=60)
+            addresses = self._parse_addresses(params[1])
+            if not addresses:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_error("gethistory", currency, ValidationError("No valid addresses provided"))
+                OperationLogger.success("gethistory", currency, duration, {"currency": currency, "success": False})
+                return ResponseHelper.error("No valid addresses provided")
 
-            if res is None or res in [-1, -2]:  # OS_ERROR or OTHER_EXCEPTION
-                logging.info(f"[server] gethistory failed for coin: {currency}")
-                return json.dumps([])
+            # DEBUG: Log parameters
+            OperationLogger.debug_params("gethistory", currency, params)
 
-            # DEBUG! PURGE EMPTY LISTS IN LIST?
+            if socket is None:
+                socket = await self.app.connection_manager.get_socket(currency)
+
+            res = await socket.send_batch(
+                "gethistory", addresses, timeout=ConfigConstants.TIMEOUT_HISTORY
+            )
+
+            if res is None:
+                duration = int(time.time() * 1000) - start_time
+                OperationLogger.debug_result("gethistory", currency, [], duration)
+                OperationLogger.success("gethistory", currency, duration, {"currency": currency, "result_count": 0})
+                return ResponseHelper.history([])
+
+            # Filter out empty results
             res = [e for e in res if e]
 
-            logger.debug(f"DEBUG MESSAGE: {str(res)}")
-            logger.info(f"[server-end gethistory] completion time: {TimestampMillisec64() - timestart}ms")
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_result("gethistory", currency, res, duration)
+            OperationLogger.success("gethistory", currency, duration, {"currency": currency, "result_count": len(res)})
+            return ResponseHelper.history(res)
 
-            return json.dumps(res)
-
-        except (NetworkError, ProtocolError) as e:
-            logging.info(f"[server] gethistory failed for coin: {currency}")
-            return json.dumps([])
+        except Exception as e:
+            duration = int(time.time() * 1000) - start_time
+            OperationLogger.debug_error("gethistory", currency, e)
+            OperationLogger.success("gethistory", currency, duration, {"currency": currency, "success": False})
+            return ResponseHelper.from_exception(e)
 
 
 class UtilityRPCHandler:
@@ -528,6 +699,8 @@ class UtilityRPCHandler:
 
     async def ping(self) -> str:
         """Simple ping method for testing connectivity."""
-        logger.info("[server] ping")
-        res = {'result': 1, 'error': None}
-        return json.dumps(res)
+        start_time = int(time.time() * 1000)
+        response = ResponseHelper.ping()
+        duration = int(time.time() * 1000) - start_time
+        OperationLogger.success("ping", "system", duration)
+        return response

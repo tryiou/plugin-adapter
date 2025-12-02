@@ -23,29 +23,29 @@ API Compatibility:
 import asyncio
 import json
 import logging
+# Setup logging
 import os
 import sys
-import time
-from decimal import Decimal
-from aiohttp import web
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-# Import refactored modules
+from aiohttp import web
+
 from src.core.application import PluginAdapterApplication
+# Import refactored modules
 from src.core.configuration import config_manager
+from src.core.constants import ConfigConstants
+from src.core.response_factory import ResponseFactory
+from src.services.monitoring_service import MonitoringService
 from src.services.rpc_handlers import (
     UTXORPCHandler, TransactionRPCHandler, BlockRPCHandler,
     BalanceRPCHandler, HistoryRPCHandler, UtilityRPCHandler
 )
-from src.utils.helpers import (
-    get_block_count, get_plugin_fees,
-    create_plugin_block_heights_response, create_plugin_tx_fees_response
-)
+from src.utils.operation_logger import OperationLogger
 
-# Setup logging
+log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s",
+    level=getattr(logging, log_level, logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(message)s",
     handlers=[
         logging.FileHandler("debug.log"),
         logging.StreamHandler()
@@ -53,16 +53,21 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Global application instance
-app = PluginAdapterApplication()
+# Logging already configured above
+
+# Global application instance with connection limits
+app = PluginAdapterApplication(max_concurrent_connections=3)
 
 # RPC Handler instances
-utxo_handler = UTXORPCHandler()
-tx_handler = TransactionRPCHandler()
-block_handler = BlockRPCHandler()
-balance_handler = BalanceRPCHandler()
-history_handler = HistoryRPCHandler()
+utxo_handler = UTXORPCHandler(app)
+tx_handler = TransactionRPCHandler(app)
+block_handler = BlockRPCHandler(app)
+balance_handler = BalanceRPCHandler(app)
+history_handler = HistoryRPCHandler(app)
 utility_handler = UtilityRPCHandler()
+
+# Monitoring service instance
+monitoring_service = MonitoringService(app)
 
 # Web routes
 routes = web.RouteTableDef()
@@ -72,6 +77,9 @@ async def switchcase(request_json: Dict[str, Any]) -> str:
     """
     Switch-case dispatcher for RPC methods - maintains exact same logic as original.
     """
+    # Extract currency for logging
+    currency = request_json['params'][0] if request_json['params'] else "system"
+
     switcher = {
         'getutxos': lambda: utxo_handler.getutxos(request_json['params']),
         'getrawtransaction': lambda: tx_handler.getrawtransaction(request_json['params']),
@@ -81,16 +89,31 @@ async def switchcase(request_json: Dict[str, Any]) -> str:
         'gettransaction': lambda: tx_handler.gettransaction(request_json['params']),
         'getblock': lambda: block_handler.getblock(request_json['params']),
         'getblockhash': lambda: block_handler.getblockhash(request_json['params']),
-        'heights': lambda: plugin_block_heights(),
-        'fees': lambda: plugin_tx_fees(),
+        'heights': lambda: monitoring_service.get_block_heights(),
+        'fees': lambda: monitoring_service.get_tx_fees(),
         'getbalance': lambda: balance_handler.getbalance(request_json['params']),
         'gethistory': lambda: history_handler.gethistory(request_json['params']),
         'ping': lambda: utility_handler.ping()
     }
-    
-    method_func = switcher.get(request_json['method'], lambda: utility_handler.ping())
-    result = await method_func()
-    return result
+
+    async def method_not_found():
+        start = OperationLogger.start("unknown_method", currency)
+        OperationLogger.error("unknown_method", currency, Exception(f"Method {request_json['method']} not found"))
+        OperationLogger.end("unknown_method", start, currency)
+        return json.dumps(ResponseFactory.error('Method not found', -32601, 'MethodNotFoundError'))
+
+    method_func = switcher.get(request_json['method'], method_not_found)
+
+    # Log the incoming request
+    # start = OperationLogger.start(request_json['method'], currency)
+
+    try:
+        result = await method_func()
+        # OperationLogger.end(request_json['method'], start, currency)
+        return result
+    except Exception as e:
+        # OperationLogger.error(request_json['method'], currency, e)
+        return json.dumps(ResponseFactory.error(str(e), -32603, 'InternalError'))
 
 
 @routes.post("/")
@@ -101,101 +124,52 @@ async def handle(request: web.Request) -> web.Response:
 
 @routes.get("/height")
 async def get_heights(request: web.Request) -> web.Response:
-    """Get block heights - maintains exact same behavior as original."""
-    return web.Response(text=await plugin_block_heights())
+    """Get block heights - uses new monitoring service."""
+    return web.Response(text=await monitoring_service.get_block_heights())
 
 
 @routes.get("/fees")
 async def get_fees(request: web.Request) -> web.Response:
-    """Get transaction fees - maintains exact same behavior as original."""
-    return web.Response(text=await plugin_tx_fees())
-
-
-async def plugin_block_heights() -> str:
-    """
-    Get block heights for all configured currencies.
-    Maintains exact same functionality and response format as original.
-    """
-    heights = {}
-    start_time = time.time()
-    
-    # Create a list of coroutines for each coin
-    currencies = config_manager.get_all_currencies()
-    coroutines = [get_block_count(coin) for coin in currencies]
-
-    # Execute the coroutines concurrently
-    results = await asyncio.gather(*coroutines, return_exceptions=True)
-
-    for i, coin in enumerate(currencies):
-        data = results[i] if not isinstance(results[i], Exception) else None
-
-        if data is None:
-            heights[coin] = None
-            continue
-
-        heights[coin] = data
-    
-    end_time = time.time()
-    execution_time = end_time - start_time
-    logger.info(f"[server] Execution time for 'plugin_block_heights': {execution_time} seconds")
-    
-    return create_plugin_block_heights_response(heights)
-
-
-async def plugin_tx_fees() -> str:
-    """
-    Get transaction fees for all configured currencies.
-    Maintains exact same functionality and response format as original.
-    """
-    fees = {}
-    
-    # Create a list of coroutines for each coin
-    currencies = config_manager.get_all_currencies()
-    coroutines = [get_plugin_fees(coin) for coin in currencies]
-
-    # Execute the coroutines concurrently
-    results = await asyncio.gather(*coroutines, return_exceptions=True)
-
-    for i, coin in enumerate(currencies):
-        data = results[i] if not isinstance(results[i], Exception) else None
-
-        if data is None:
-            fees[coin] = None
-            continue
-
-        fees[coin] = Decimal('{:.8f}'.format(data))
-
-    return create_plugin_tx_fees_response(fees)
+    """Get transaction fees - uses new monitoring service."""
+    return web.Response(text=await monitoring_service.get_tx_fees())
 
 
 async def main():
     """
-    Main application entry point - maintains exact same startup sequence as original.
+    Main application entry point with proper shutdown coordination.
     """
+    shutdown_event = asyncio.Event()
+
     try:
         # Setup routes
         await app.server.setup_routes(routes)
-        
+
         # Start the application
-        await app.start(5000)
-        
-        logger.info("[adapter] Plugin adapter started successfully")
-        
-        # Keep the main thread alive
-        while app.heartbeat_manager._running:
-            await asyncio.sleep(1)
-            
+        await app.start(ConfigConstants.DEFAULT_SERVER_PORT, shutdown_event)
+
+        # Log detailed startup information
+        currencies = config_manager.get_all_currencies()
+        start = OperationLogger.start("startup", "adapter")
+        logger.info("Plugin Adapter started successfully")
+        logger.info("Server listening on 0.0.0.0:%d", ConfigConstants.DEFAULT_SERVER_PORT)
+        logger.info("Configured currencies: %s", ", ".join(currencies) if currencies else "None")
+        logger.info("Environment: UTXO_PLUGIN_LIST=%s", os.environ.get('UTXO_PLUGIN_LIST', 'Not set'))
+
+        # Wait for shutdown signal instead of running indefinitely
+        await shutdown_event.wait()
+        OperationLogger.end("shutdown_signal", start, "adapter")
+
     except (asyncio.CancelledError, KeyboardInterrupt):
-        logger.info("[adapter] Application startup cancelled - this is expected during shutdown")
+        OperationLogger.end("startup", start, "adapter")
     except Exception as e:
-        logger.error(f"[adapter] Fatal error: {e}")
+        OperationLogger.error("startup", "adapter", e)
         sys.exit(1)
     finally:
         # Ensure proper cleanup regardless of how we exit
         try:
             await app.stop()
         except Exception as e:
-            logger.error(f"[adapter] Error during cleanup: {e}")
+            OperationLogger.error("cleanup", "adapter", e)
             # Force exit if cleanup fails
             sys.exit(1)
 
@@ -203,10 +177,10 @@ async def main():
 if __name__ == '__main__':
     # Ensure UTXO_PLUGIN_LIST is set
     if not os.environ.get('UTXO_PLUGIN_LIST'):
-        logger.error("[adapter] FATAL: UTXO_PLUGIN_LIST environment variable not set")
+        OperationLogger.error("main", "adapter", Exception("UTXO_PLUGIN_LIST environment variable not set"))
         print("ERROR: UTXO_PLUGIN_LIST environment variable is required")
         print("Please set it in format: 'CURRENCY1:HOST1,CURRENCY2:HOST2,...'")
         sys.exit(1)
-    
+
     # Run the application
     asyncio.run(main())

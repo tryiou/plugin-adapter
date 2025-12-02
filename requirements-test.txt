@@ -1,0 +1,102 @@
+# Test dependencies for plugin-adapter application
+# Install with: pip install -r requirements-test.txt
+
+# Core testing framework
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.0
+pytest-xdist>=3.5.0  # Parallel test execution
+pytest-timeout>=2.3.0  # Test timeout management
+pytest-benchmark>=4.0.0  # Performance benchmarking
+
+# Async testing support
+asyncio-mqtt>=0.13.0  # For async MQTT testing if needed
+
+# HTTP testing
+aiohttp>=3.10.0  # For HTTP client testing
+requests-mock>=1.12.0  # HTTP request mocking
+responses>=0.25.0  # HTTP response mocking
+
+# Network and socket testing
+socketify>=0.0.31  # Fast async networking (alternative to aiorpcX for testing)
+
+# Mocking and stubbing
+freezegun>=1.5.0  # Time mocking for deterministic tests
+factory-boy>=3.3.0  # Test data generation
+faker>=21.0.0  # Fake data generation
+
+# Code quality and analysis
+flake8>=7.0.0  # Code linting
+black>=24.0.0  # Code formatting
+mypy>=1.8.0  # Type checking
+isort>=5.13.0  # Import sorting
+
+# Coverage and reporting
+coverage[toml]>=7.5.0  # Coverage measurement with TOML support
+pytest-html>=4.0.0  # HTML test reports
+pytest-json-report>=1.5.0  # JSON test reports
+
+# Performance and load testing
+locust>=2.20.0  # Load testing
+memory-profiler>=0.61.0  # Memory profiling
+py-spy>=0.3.14  # Performance profiling
+
+# Documentation testing
+sphinx>=7.3.0  # Documentation generation
+sphinx-rtd-theme>=2.0.0  # Read the Docs theme
+sphinx-autodoc-typehints>=1.25.0  # Type hint documentation
+
+# Development and debugging
+ipdb>=0.13.13  # Debugger
+pdbpp>=0.10.3  # Enhanced debugger
+watchdog>=3.0.0  # File watching for development
+
+# Security testing
+bandit>=1.7.5  # Security linting
+safety>=3.0.0  # Security vulnerability scanning
+
+# Integration testing utilities
+docker>=7.0.0  # Docker integration for integration tests
+testcontainers>=3.7.0  # Test containers for integration testing
+
+# Data validation
+jsonschema>=4.20.0  # JSON schema validation
+pydantic>=2.7.0  # Data validation and settings management
+
+# Time and date testing
+pytz>=2024.1  # Timezone handling
+python-dateutil>=2.9.0  # Date/time utilities
+
+# Logging and monitoring
+loguru>=0.7.2  # Enhanced logging
+structlog>=24.1.0  # Structured logging
+
+# Configuration testing
+python-dotenv>=1.1.0  # Environment variable loading
+configparser>=6.0.0  # Configuration file parsing
+
+# Database testing (if needed in future)
+# pytest-postgresql>=5.0.0  # PostgreSQL testing
+# pytest-redis>=3.0.0  # Redis testing
+# sqlite3  # Built-in SQLite for simple database testing
+
+# Network protocol testing
+# scapy>=2.5.0  # Network packet manipulation (if needed)
+
+# Version control integration
+# gitpython>=3.1.43  # Git integration for testing
+
+# CI/CD integration
+# pre-commit>=3.6.0  # Pre-commit hooks
+
+# Optional: Advanced testing patterns
+hypothesis>=6.100.0  # Property-based testing
+parameterized>=0.9.0  # Parameterized testing
+
+# Type stubs for better type checking
+types-requests>=2.31.0
+types-freezegun>=1.1.10
+types-python-dateutil>=2.9.0
+
+tabulate>=0.9.0

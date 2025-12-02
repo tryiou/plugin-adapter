@@ -2,9 +2,12 @@
 
 import logging
 import os
-from dataclasses import dataclass, field
-from threading import Lock
-from typing import Dict, List, Any, Optional
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from src.core.constants import ConfigConstants
+from src.utils.operation_logger import OperationLogger
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +17,6 @@ class CoinConfig:
     """Configuration for a single cryptocurrency."""
     host: str
     port: int
-    socket: Optional['TCPSocket'] = None
 
 
 class ConfigurationManager:
@@ -31,7 +33,7 @@ class ConfigurationManager:
             "SYS", "TZC", "XSN", "UNO", "PKOIN"
         ]
         self._hashx_cache: Dict[str, Any] = {}
-        self._lock = Lock()
+        self._lock = threading.RLock()  # Reentrant lock for both sync and async
 
     @property
     def allowed_currencies(self) -> List[str]:
@@ -50,6 +52,16 @@ class ConfigurationManager:
         with self._lock:
             return self._hashx_cache.copy()
 
+    async def get_coins_async(self) -> Dict[str, CoinConfig]:
+        """Async-safe method to get coins configuration."""
+        with self._lock:
+            return {k: v for k, v in self._coins.items()}
+
+    async def get_hashx_cache_async(self) -> Dict[str, Any]:
+        """Async-safe method to get hashx cache."""
+        with self._lock:
+            return self._hashx_cache.copy()
+
     def load_from_environment(self) -> None:
         """
         Load cryptocurrency configurations from environment variables.
@@ -57,9 +69,12 @@ class ConfigurationManager:
         Expects UTXO_PLUGIN_LIST environment variable in format:
         "CURRENCY1:HOST1,CURRENCY2:HOST2,..."
         """
+        start = OperationLogger.start("load_from_environment", "system")
         utxo_plugins = os.environ.get('UTXO_PLUGIN_LIST')
         if not utxo_plugins:
-            logger.warning("[config] UTXO_PLUGIN_LIST environment variable not set")
+            OperationLogger.error("load_from_environment", "system",
+                                  Exception("UTXO_PLUGIN_LIST environment variable not set"))
+            OperationLogger.end("load_from_environment", start, "system")
             return
 
         with self._lock:
@@ -70,16 +85,17 @@ class ConfigurationManager:
                     host = host.strip()
 
                     if currency not in self._allowed_currencies:
-                        logger.warning(f"[config] Skipping unsupported currency: {currency}")
+                        OperationLogger.error("load_from_environment", currency,
+                                              Exception(f"Unsupported currency: {currency}"))
                         continue
 
-                    self._coins[currency] = CoinConfig(host=host, port=8000)
-                    logger.info(f"[config] Loaded configuration for {currency}: {host}:8000")
+                    self._coins[currency] = CoinConfig(host=host, port=ConfigConstants.DEFAULT_ELECTRUM_PORT)
+                    # No need to log success for each currency - just count them
 
                 except ValueError as e:
-                    logger.error(f"[config] Invalid UTXO_PLUGIN_LIST format for: {utxo_plugin} - {e}")
+                    OperationLogger.error("load_from_environment", "system", e)
 
-        logger.info(f'[config] ACTIVE UTXOPLUGINS:\n{self._coins}')
+        OperationLogger.end("load_from_environment", start, "system")
 
     def get_coin_config(self, currency: str) -> Optional[CoinConfig]:
         """
@@ -93,31 +109,6 @@ class ConfigurationManager:
         """
         with self._lock:
             return self._coins.get(currency)
-
-    def set_coin_socket(self, currency: str, socket: 'TCPSocket') -> bool:
-        """
-        Set the socket connection for a currency.
-        
-        Args:
-            currency: Currency symbol
-            socket: TCPSocket instance
-            
-        Returns:
-            True if successful, False if currency not found
-        """
-        with self._lock:
-            if currency in self._coins:
-                old_socket = self._coins[currency].socket
-                self._coins[currency].socket = socket
-                
-                # Log socket state changes for debugging
-                old_state = "None" if old_socket is None else f"Connected: {old_socket.is_connected}"
-                new_state = "None" if socket is None else f"Connected: {socket.is_connected}"
-                logger.info(f"[config] {currency} - Socket updated. Old: {old_state}, New: {new_state}")
-                
-                return True
-            logger.warning(f"[config] Attempted to set socket for unknown currency: {currency}")
-            return False
 
     def has_currency(self, currency: str) -> bool:
         """
@@ -152,6 +143,16 @@ class ConfigurationManager:
         """Get a value from the hashx cache."""
         with self._lock:
             return self._hashx_cache.get(key)
+
+    async def close(self) -> None:
+        """Close all connections and cleanup resources."""
+        # start = OperationLogger.start("close", "system")
+        with self._lock:
+            # Clear all references to help garbage collection
+            self._coins.clear()
+            self._hashx_cache.clear()
+
+        # OperationLogger.end("close", start, "system")
 
 
 # Global configuration manager instance - this replaces the global 'coins' variable

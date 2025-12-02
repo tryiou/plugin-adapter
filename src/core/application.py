@@ -2,117 +2,20 @@
 
 import asyncio
 import logging
+import os
 import signal
-import time
-from aiohttp import web
 from multiprocessing import Process
-from threading import Thread, Event
-from typing import Dict, List, Optional, Any
+from typing import Any, Optional
+
+from aiohttp import web
 
 from src.core.configuration import config_manager
-from src.core.error_handling import NetworkError, ProtocolError
-from src.networking.tcp_socket import TCPSocket
-from src.utils.helpers import get_info
+from src.core.connection_manager import ConnectionManager
+from src.core.constants import ConfigConstants
+from src.core.heartbeat_service import HeartbeatService
+from src.utils.operation_logger import OperationLogger
 
 logger = logging.getLogger(__name__)
-
-
-class HeartbeatManager:
-    """
-    Thread-safe heartbeat manager that replaces the problematic HeartbeatThread.
-    Uses proper async patterns instead of creating new event loops in threads.
-    """
-
-    def __init__(self):
-        """Initialize the heartbeat manager with thread-safe state."""
-        self._running = False
-        self._stop_event = Event()
-        self._heartbeat_thread: Optional[Thread] = None
-
-    def start(self) -> None:
-        """Start the heartbeat monitoring."""
-        if self._running:
-            logger.warning("[heartbeat] Heartbeat is already running")
-            return
-
-        self._running = True
-        self._stop_event.clear()
-        self._heartbeat_thread = Thread(target=self._run_heartbeat, name="HeartbeatThread")
-        self._heartbeat_thread.start()
-        logger.info("[heartbeat] Heartbeat manager started")
-
-    def stop(self) -> None:
-        """Stop the heartbeat monitoring."""
-        if not self._running:
-            logger.warning("[heartbeat] Heartbeat is not running")
-            return
-
-        logger.info("[heartbeat] Stopping heartbeat manager")
-        self._running = False
-        self._stop_event.set()
-
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=5)
-            if self._heartbeat_thread.is_alive():
-                logger.warning("[heartbeat] Heartbeat thread did not stop gracefully")
-
-    def _run_heartbeat(self) -> None:
-        """Main heartbeat loop running in a separate thread."""
-        try:
-            # Initial connection check for all currencies
-            logger.info("[heartbeat] Performing initial connection checks")
-
-            # Use asyncio.run() to create a proper event loop in this thread
-            asyncio.run(self._initial_heartbeat())
-
-            # Main heartbeat loop
-            while self._running and not self._stop_event.is_set():
-                logger.debug("[heartbeat] Running periodic heartbeat check")
-                try:
-                    asyncio.run(self._periodic_heartbeat())
-                except Exception as e:
-                    logger.error(f"[heartbeat] Error in periodic heartbeat: {e}")
-
-                if self._stop_event.wait(timeout=15):
-                    break
-
-        except Exception as e:
-            logger.error(f"[heartbeat] Fatal error in heartbeat thread: {e}")
-        finally:
-            logger.info("[heartbeat] Heartbeat thread stopped")
-
-    async def _initial_heartbeat(self) -> None:
-        """Perform initial heartbeat for all configured currencies."""
-        currencies = config_manager.get_all_currencies()
-        if not currencies:
-            logger.warning("[heartbeat] No currencies configured for initial heartbeat")
-            return
-
-        logger.info(f"[heartbeat] Initial heartbeat for {len(currencies)} currencies: {currencies}")
-
-        # Create coroutines for all currencies
-        coroutines = [get_info(currency, initial=True) for currency in currencies]
-
-        # Execute concurrently
-        try:
-            await asyncio.gather(*coroutines, return_exceptions=True)
-        except Exception as e:
-            logger.error(f"[heartbeat] Error during initial heartbeat: {e}")
-
-    async def _periodic_heartbeat(self) -> None:
-        """Perform periodic heartbeat for all configured currencies."""
-        currencies = config_manager.get_all_currencies()
-        if not currencies:
-            return
-
-        # Create coroutines for all currencies
-        coroutines = [get_info(currency, initial=False) for currency in currencies]
-
-        # Execute concurrently
-        try:
-            await asyncio.gather(*coroutines, return_exceptions=True)
-        except Exception as e:
-            logger.error(f"[heartbeat] Error during periodic heartbeat: {e}")
 
 
 class ApplicationServer:
@@ -120,58 +23,92 @@ class ApplicationServer:
     Main application server that manages the web server and application lifecycle.
     """
 
-    def __init__(self):
+    def __init__(self, max_concurrent_connections: int = 3):
         """Initialize the application server."""
         self._app = web.Application()
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._process: Optional[Process] = None
-        self._heartbeat_manager = HeartbeatManager()
+        self._connection_manager = ConnectionManager(max_concurrent_connections)
+        self._heartbeat_service = HeartbeatService(self._connection_manager)
 
     async def setup_routes(self, routes: web.RouteTableDef) -> None:
         """Setup web routes for the application."""
+        start = OperationLogger.start("configure_routes", "server")
         self._app.add_routes(routes)
-        logger.info("[server] Routes configured")
+        OperationLogger.end("configure_routes", start, "server")
 
-    async def start(self, port: int = 5000) -> None:
+    async def start(self, port: int = ConfigConstants.DEFAULT_SERVER_PORT,
+                    shutdown_event: Optional[asyncio.Event] = None) -> None:
         """
         Start the application server.
         
         Args:
             port: Port number to bind the server to
+            shutdown_event: Event to signal shutdown (optional)
         """
+        start = OperationLogger.start("server_start", "server")
+
         try:
-            # Setup the server
-            self._runner = web.AppRunner(self._app)
+            # Setup the server - disable access logging to reduce noise
+            self._runner = web.AppRunner(self._app, access_log=None)
             await self._runner.setup()
 
             self._site = web.TCPSite(self._runner, '0.0.0.0', port)
             await self._site.start()
 
-            logger.info(f"[server] Server started on port {port}")
-
             # Start heartbeat monitoring
-            self._heartbeat_manager.start()
+            await self._heartbeat_service.start()
+
+            # Store shutdown event for coordination
+            self._shutdown_event = shutdown_event
+
+            OperationLogger.end("server_start", start, "server")
 
         except Exception as e:
-            logger.error(f"[server] Failed to start server: {e}")
+            OperationLogger.error("server_start", "server", e)
             raise
 
     async def stop(self) -> None:
-        """Stop the application server."""
-        logger.info("[server] Stopping application server")
+        """Enhanced stop method with proper shutdown coordination."""
+        start = OperationLogger.start("stop", "server")
 
-        # Stop heartbeat first
-        self._heartbeat_manager.stop()
+        try:
+            # Close all connections with proper error handling
+            try:
+                await self._connection_manager.close_all()
+                OperationLogger.end("connections_close", start, "server")
+            except Exception as e:
+                OperationLogger.error("connections_close", "server", e)
 
-        # Stop web server
-        if self._site:
-            await self._site.stop()
+            # Stop web server with proper cleanup
+            if self._site:
+                try:
+                    await self._site.stop()
+                    OperationLogger.end("web_server_stop", start, "server")
+                except Exception as e:
+                    OperationLogger.error("web_server_stop", "server", e)
 
-        if self._runner:
-            await self._runner.cleanup()
+            if self._runner:
+                try:
+                    await self._runner.cleanup()
+                    OperationLogger.end("web_runner_cleanup", start, "server")
+                except Exception as e:
+                    OperationLogger.error("web_runner_cleanup", "server", e)
 
-        logger.info("[server] Application server stopped")
+            # Close configuration manager resources
+            try:
+                await config_manager.close()
+                OperationLogger.end("config_manager_close", start, "server")
+            except Exception as e:
+                OperationLogger.error("config_manager_close", "server", e)
+
+            OperationLogger.end("stop", start, "server")
+
+        except Exception as e:
+            OperationLogger.error("stop", "server", e)
+            # Continue with shutdown even if there are errors
+            pass
 
     @property
     def app(self) -> web.Application:
@@ -185,15 +122,16 @@ class PluginAdapterApplication:
     Provides a clean interface for starting and stopping the entire application.
     """
 
-    def __init__(self):
+    def __init__(self, max_concurrent_connections: int = 3):
         """Initialize the plugin adapter application."""
-        self._server = ApplicationServer()
+        self._server = ApplicationServer(max_concurrent_connections)
         self._signal_handlers_installed = False
+        self._shutdown_initiated = False
 
     async def initialize(self) -> None:
         """Initialize the application by setting up all components."""
-        logger.info("[adapter] Initializing plugin adapter application")
-        
+        start = OperationLogger.start("initialize", "adapter")
+
         try:
             # Load configuration
             config_manager.load_from_environment()
@@ -201,105 +139,172 @@ class PluginAdapterApplication:
             # Setup network connections
             await self._setup_network_connections()
 
-            logger.info("[adapter] Application initialization complete")
+            OperationLogger.end("initialize", start, "adapter")
         except (asyncio.CancelledError, KeyboardInterrupt):
-            logger.info("[adapter] Initialization cancelled, shutting down")
+            OperationLogger.end("initialize", start, "adapter")
             # Re-raise to allow proper cleanup
             raise
         except Exception as e:
-            logger.error(f"[adapter] Failed to initialize: {e}")
+            OperationLogger.error("initialize", "adapter", e)
             raise
 
     async def _setup_network_connections(self) -> None:
-        """Setup TCP connections to all configured ElectrumX servers."""
+        """Setup TCP connections to all configured ElectrumX servers using ConnectionManager."""
         currencies = config_manager.get_all_currencies()
         if not currencies:
-            logger.warning("[adapter] No currencies configured, skipping network setup")
+            OperationLogger.error("setup_network", "adapter",
+                                  Exception("No currencies configured, skipping network setup"))
             return
 
-        logger.info(f"[adapter] Setting up network connections for {len(currencies)} currencies")
+        start = OperationLogger.start("setup_network", "adapter")
 
+        # Use ConnectionManager to establish all connections
         for currency in currencies:
-            coin_config = config_manager.get_coin_config(currency)
-            if not coin_config:
-                continue
-
             try:
-                # Create socket connection
-                socket = TCPSocket(coin_config.host, coin_config.port + 1000)
-                await socket.connect()
-
-                # Register socket in configuration
-                config_manager.set_coin_socket(currency, socket)
-
-                logger.info(f"[adapter] Registered host {coin_config.host} port {coin_config.port} for coin {currency}")
-
+                socket = await self._server._connection_manager.get_socket(currency)
             except Exception as e:
-                logger.error(f"[adapter] Failed to connect to {currency}: {e}")
+                OperationLogger.error("setup_network", currency, e)
 
-        logger.info(f"[adapter] Have {len(currencies)} coin/port pair(s)")
+        OperationLogger.end("setup_network", start, "adapter")
 
-    async def start(self, port: int = 5000) -> None:
+    async def start(self, port: int = ConfigConstants.DEFAULT_SERVER_PORT,
+                    shutdown_event: Optional[asyncio.Event] = None) -> None:
         """
         Start the application.
         
         Args:
             port: Port number for the web server
+            shutdown_event: Event to signal shutdown (optional)
         """
         await self.initialize()
-        await self._server.start(port)
+        await self._server.start(port, shutdown_event)
         self._install_signal_handlers()
-        logger.info(f"[server] Starting RPC server on port {port}")
 
     async def stop(self) -> None:
         """Stop the application."""
-        logger.info("[adapter] Stopping plugin adapter application")
+        start = OperationLogger.start("stop", "adapter")
+
+        # Stop heartbeat service first to prevent new connections
+        await self._server._heartbeat_service.stop()
+
+        # Shutdown connection manager to prevent new connections
+        self._server._connection_manager.shutdown()
+
+        # Remove signal handlers
         self._remove_signal_handlers()
+
+        # Stop the server
         await self._server.stop()
-        logger.info("[adapter] Application stopped")
+        OperationLogger.end("stop", start, "adapter")
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
         """
-        Handle shutdown signals gracefully.
+        Handle shutdown signals immediately and aggressively.
         This runs in the main thread, so we need to schedule shutdown in the event loop.
         
         Args:
             signum: Signal number
             frame: Signal frame
         """
-        logger.info(f"[adapter] Caught signal {signum}. Shutting down gracefully.")
-        
-        # Cancel any running tasks in the current event loop
+        start = OperationLogger.start("signal_caught", "adapter")
+
+        # Set shutdown flag
+        self._shutdown_initiated = True
+
+        # Schedule shutdown in the event loop thread
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             if loop.is_running():
-                # Cancel all tasks except the current one
+                # Schedule shutdown coroutine
+                shutdown_task = loop.create_task(self._shutdown_coroutine())
+                OperationLogger.end("shutdown_scheduled", start, "adapter")
+
+                # Cancel ALL tasks immediately for instant shutdown
                 for task in asyncio.all_tasks(loop):
                     if task is not asyncio.current_task(loop):
                         task.cancel()
+
         except RuntimeError:
-            # No event loop running, signal was received during startup
-            logger.info("[adapter] Signal received during startup, will be handled by main loop")
+            # No running loop, signal received during startup
+            OperationLogger.end("signal_during_startup", start, "adapter")
+            os._exit(0)
+        except Exception as e:
+            OperationLogger.error("schedule_shutdown", "adapter", e)
+            os._exit(1)
+
+    async def _shutdown_coroutine(self) -> None:
+        """
+        Immediate shutdown coroutine with aggressive task cancellation.
+        """
+        start = OperationLogger.start("async_shutdown_start", "adapter")
+
+        try:
+            # Step 1: Stop accepting new requests - IMMEDIATE EXIT
+            OperationLogger.start("stopping_web_server", "adapter")
+
+            # Stop heartbeat service first to prevent new connections
+            await self._server._heartbeat_service.stop()
+
+            # Shutdown connection manager to prevent new connections
+            self._server._connection_manager.shutdown()
+
+            # Remove signal handlers
+            self._remove_signal_handlers()
+
+            # Step 2: Cancel ALL remaining tasks immediately
+            OperationLogger.start("cancelling_tasks", "adapter")
+            loop = asyncio.get_running_loop()
+            tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task(loop)]
+
+            if tasks:
+                OperationLogger.start("cancelling_remaining_tasks", "adapter")
+                for task in tasks:
+                    if hasattr(task, 'cancel'):
+                        task.cancel()
+
+                # Don't wait - just exit immediately
+                OperationLogger.end("tasks_cancelled_immediately", start, "adapter")
+
+            # Step 3: Signal shutdown event if available
+            if hasattr(self, '_shutdown_event') and self._shutdown_event:
+                self._shutdown_event.set()
+                OperationLogger.end("shutdown_event_signaled", start, "adapter")
+
+            OperationLogger.end("async_shutdown_complete", start, "adapter")
+
+            # IMMEDIATE EXIT - no waiting for anything
+            os._exit(0)
+
+        except Exception as e:
+            OperationLogger.error("shutdown", "adapter", e)
+            # Force exit if shutdown fails
+            os._exit(1)
 
     def _install_signal_handlers(self) -> None:
         """Install signal handlers for graceful shutdown."""
+        start = OperationLogger.start("install_signal_handlers", "adapter")
+
         if self._signal_handlers_installed:
+            OperationLogger.end("install_signal_handlers", start, "adapter")
             return
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         self._signal_handlers_installed = True
-        logger.info("[adapter] Signal handlers installed")
+        OperationLogger.end("install_signal_handlers", start, "adapter")
 
     def _remove_signal_handlers(self) -> None:
         """Remove signal handlers."""
+        start = OperationLogger.start("remove_signal_handlers", "adapter")
+
         if not self._signal_handlers_installed:
+            OperationLogger.end("remove_signal_handlers", start, "adapter")
             return
 
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         self._signal_handlers_installed = False
-        logger.info("[adapter] Signal handlers removed")
+        OperationLogger.end("remove_signal_handlers", start, "adapter")
 
     @property
     def server(self) -> ApplicationServer:
@@ -307,6 +312,11 @@ class PluginAdapterApplication:
         return self._server
 
     @property
-    def heartbeat_manager(self) -> HeartbeatManager:
-        """Get the heartbeat manager instance."""
-        return self._server._heartbeat_manager
+    def heartbeat_service(self) -> HeartbeatService:
+        """Get the heartbeat service instance."""
+        return self._server._heartbeat_service
+
+    @property
+    def connection_manager(self) -> 'ConnectionManager':
+        """Get the connection manager instance."""
+        return self._server._connection_manager
